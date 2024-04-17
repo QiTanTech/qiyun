@@ -1,0 +1,4 @@
+qiyun_release_v1.3.sif filter=lfs diff=lfs merge=lfs -text
+*.tar.gz filter=lfs diff=lfs merge=lfs -text
+singularity_setup/go1.20.5.linux-amd64.tar.gz filter=lfs diff=lfs merge=lfs -text
+singularity_setup/singularity-ce-3.11.4.tar.gz filter=lfs diff=lfs merge=lfs -text
