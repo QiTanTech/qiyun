@@ -21,7 +21,7 @@ To use qiyun, the command line is "./qiyun COMMAND", see the manual for detailed
 
 ## Warning
 Some files in the repository are large file (LFS), so you need to install [git-lfs](https://git-lfs.com/) to clone the repository.
-Or you can download the repository as a [zip file](http://gitlab.qitantech.com/chandlerxu/qiyun_release/-/archive/v1.3/qiyun_release-v1.3.zip) and extract it.
+Or you can download the repository as a [zip file](https://github.com/QiTanTech/qiyun/archive/refs/heads/v1.3.zip) and extract it.
 
 Check the md5sum of qiyun_release_v1.3.sif to make sure the file is correct.
 qiyun_release_v1.3.sif: 858c2d7aa0dafd8a3085c123d9321d85
