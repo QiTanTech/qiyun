@@ -8,11 +8,17 @@ Qiyun is a tool to create consensus sequences and haploid variant calls from QIT
 
 
 ## Installation
+### Install singularity
 Qiyun is build on the singularity container technology. Singularity is needed to run the container.
 
 The repository contains a script (singularity_setup/singularity_setup.sh) to install [singularity](https://sylabs.io/singularity/), clone the repository, change directory to the folder, and run "bash singularity_setup.sh" to install singularity.
 
-If singularity is installed in your machine, you can check if qiyun is working in the repository by running "./qiyun -v".
+### Download QiYun image
+Meanwhile, the image of QiYun should be downloaded in the repository directory, the url of the images is: https://qitan-qiyun.obs.cn-southwest-2.myhuaweicloud.com/qiyun_release_v1.3.sif
+
+Or, change to the repository root directory, run command "singularity pull qiyun_release_v1.3.sif library://qitantech/qiyun/qiyun:v1.3" to pull the image to local.
+
+If singularity is installed in your machine and image is downloaded, you can check if qiyun is working in the root repository directory by running "./qiyun -v".
 
 
 ## Usage
