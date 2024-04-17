@@ -1,0 +1,1182 @@
+#!/bin/bash
+
+ProgName=$(basename $0)
+VER="v1.3"
+ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+IMAGE=${ROOT}/qiyun_release_${VER}.sif
+TMP_PATH=${ROOT}/temp
+if [ ! -d ${TMP_PATH} ];then
+    mkdir -p ${TMP_PATH}
+fi
+
+
+sub_help(){
+    echo "Usage: $ProgName [-h] [-v] <COMMAND> [OPTIONS]"
+    echo ""
+    echo "Optional arguments:"
+    echo "  -h                  show help message and exit"
+    echo "  -v                  show version number and exit"
+    echo ""
+    echo "Commands:"
+    echo "  models              List current available models"
+    echo "  consensus           Directly generate consensus from reads"
+    echo "  polish              Polishing draft into consensus by reads"
+    echo "  evaluate            Align assembly or consensus to reference and output accuracy statistics"
+    echo "  hap_variant         Detecting haploid variants from reads."
+    echo "  consensus2vcf       Detecting haploid variants from consensus."
+    echo "  evaluate_vcf        Evaluate variants detection."
+    echo "  datafilter          Filter reads by QScore and length"
+    echo "  assemble            De novo assemble draft from reads, builtin method is flye"
+    echo ""
+    echo "Run 'qiyun <COMMAND> -h' for more information on one of the commands"
+}
+
+sub_datafilter(){
+    usage="\
+Usage: qiyun datafilter [-l MIN_LEN] [-q MIN_Q] [-d DEPTH]
+                        [-g GENOME_SIZE] [-o OUT_DIR] input_reads
+
+Tools for filtering data.
+
+Positional arguments:
+    input_reads             Input reads path, should be fastq file.
+
+Optional arguments:
+    -h                      Show this help and exit.
+    -l                      Minimum length of reads. (default: 400)
+    -q                      Minimum quality of reads. (default: 8)
+    -d                      Subsample reads to designated depth, 0 denotes no subsampling. (default: 0)
+    -g                      Genome size for depth estimation, e.g. 1000, 3.9kb, 4.5MB. Required when -d option is provided
+    -o                      Output directory, default is input directory.
+    "
+    READS_PATH=""
+    MIN_LEN=400
+    MINQ=8
+    DEPTH=0
+    GENOME_SIZE=""
+    OUT_DIR=""
+    while [ -n "$1" ]; do
+        case "$1" in
+            -h)
+                echo "$usage"
+                exit
+                ;;
+            -l)
+                if [[ ! $2 =~ ^[0-9]+$ ]]; then
+                    echo "[ERROR] -l option should followed by an integer value" >&2
+                    exit 1
+                fi
+                MIN_LEN="$2"
+                shift 2
+                ;;
+            -q)
+                if [[ ! $2 =~ ^[0-9]+$ ]]; then
+                    echo "[ERROR] -q option should followed by an integer value" >&2
+                    exit 1
+                fi
+                MINQ="$2"
+                shift 2
+                ;;
+            -d)
+                if [[ ! $2 =~ ^[0-9]+$ ]]; then
+                    echo "[ERROR] -d option should followed by an integer value" >&2
+                    exit 1
+                fi
+                DEPTH="$2"
+                shift 2
+                ;;
+            -g)
+                if [[ -z "$2" ]]; then
+                    echo "[ERROR] missing argument for -g option" >&2
+                    exit 1
+                fi
+                GENOME_SIZE="$2"
+                shift 2
+                ;;
+            -o)
+                if [[ -z "$2" ]]; then
+                    echo "[ERROR] missing argument for -o option" >&2
+                    exit 1
+                fi
+                OUT_DIR="$2"
+                shift 2
+                ;;
+            *)
+                if [ -z $READS_PATH ] && [[ ! $1 =~ ^- ]]; then
+                    READS_PATH="$1"
+                    shift 1
+                else
+                    echo "[ERROR] Invalid option: $1" >&2
+                    echo "$usage"
+                    exit 1
+                fi
+                ;;
+        esac
+    done
+
+    # 参数检查
+    if [ -z "${READS_PATH}" ]; then
+        echo "[ERROR] Input reads path is required" >&2
+        exit 1
+    fi
+    if [ ! -f "${READS_PATH}" ]; then
+        echo "[ERROR] Input reads path \"${READS_PATH}\" is not a valid file" >&2
+        exit 1
+    fi
+    if [ $DEPTH -gt 0 ] && [ -z "$GENOME_SIZE" ];then
+        echo "[ERROR] Detect -d option, -g option is also required" >&2
+        exit 1
+    fi
+    if [ -n "${OUT_DIR}" ] && [ ! -d "${OUT_DIR}" ]; then
+        echo "[WARNING] Cannot find output directory \"${OUT_DIR}\", create this directory..."
+        mkdir -p "${OUT_DIR}"
+    fi
+
+    input_dir=`dirname ${READS_PATH}`
+    input_dir=`cd ${input_dir};pwd`
+    fname="${READS_PATH##*/}"
+    if [ -z "${OUT_DIR}" ];then
+        OUT_DIR=$input_dir
+    fi
+    
+    if [ "${OUT_DIR}" = "${input_dir}" ];then
+        cmd="singularity exec \
+            --bind ${input_dir}:/filter_input \
+            --bind ${TMP_PATH}:/qiyun/temp \
+            ${IMAGE} qiyun_datafilter /filter_input/${fname} -l ${MIN_LEN} -q ${MINQ} -o /filter_input --or ${OUT_DIR}"
+    else
+        cmd="singularity exec \
+            --bind ${input_dir}:/filter_input \
+            --bind ${OUT_DIR}:/filter_output \
+            --bind ${TMP_PATH}:/qiyun/temp \
+            ${IMAGE} qiyun_datafilter /filter_input/${fname} -l ${MIN_LEN} -q ${MINQ} -o /filter_output --or ${OUT_DIR}"
+    fi
+
+    if [ $DEPTH -gt 0 ]; then
+        cmd=$cmd" -d ${DEPTH} -g ${GENOME_SIZE}"
+    fi
+
+    $cmd || echo "Data filter failed, please check logs for more information"
+
+    temp_file=${TMP_PATH}/filtered.fastq
+    if [ -f "${temp_file}" ];then
+        rm ${temp_file}
+    fi
+
+    temp_file=${TMP_PATH}/NanoFilt.log
+    if [ -f "${temp_file}" ];then
+        rm ${temp_file}
+    fi
+
+}
+
+
+sub_assemble(){
+    usage="\
+Usage: qiyun assemble [-n N_POL] [-g GENOME_SIZE] [-t THREADS] [-o OUT_DIR] input_reads
+
+De Novo assemble reads into draft assembly. Using flye for long reads assembly. When reads lengths are short, canu will be used and -g option is required.
+
+Positional arguments:
+    input_reads             Input reads path, should be fastq file.
+
+Optional arguments:
+    -h                      Show this help and exit.
+    -n                      Number of polishing iterations in flye. (default: 1)
+    -g                      Estimate genome size for canu assembly, can be 4.7m, 3.5k, 4500.
+    -t                      Number of parallel threads. (default: 1)
+    -o                      Output directory, default is input directory.
+    "
+    READS_PATH=""
+    GENOME_SIZE=""
+    N_POL=1
+    THREADS=1
+    OUT_DIR=""
+    while [ -n "$1" ]; do
+        case "$1" in
+            -h)
+                echo "$usage"
+                exit
+                ;;
+            -n)
+                if [[ ! $2 =~ ^[0-9]+$ ]]; then
+                    echo "[ERROR] -n option should followed by an integer value" >&2
+                    exit 1
+                fi
+                N_POL="$2"
+                shift 2
+                ;;
+            -g)
+                if [[ -z "$2" ]]; then
+                    echo "[ERROR] missing argument for -g option" >&2
+                    exit 1
+                fi
+                GENOME_SIZE="$2"
+                shift 2
+                ;;
+            -t)
+                if [[ ! $2 =~ ^[0-9]+$ ]]; then
+                    echo "[ERROR] -t option should followed by an integer value" >&2
+                    exit 1
+                fi
+                THREADS="$2"
+                shift 2
+                ;;
+            -o)
+                if [[ -z "$2" ]]; then
+                    echo "[ERROR] missing argument for -o option" >&2
+                    exit 1
+                fi
+                OUT_DIR="$2"
+                shift 2
+                ;;
+            *)
+                if [ -z $READS_PATH ] && [[ ! $1 =~ ^- ]]; then
+                    READS_PATH="$1"
+                    shift 1
+                else
+                    echo "[ERROR] Invalid option: $1" >&2
+                    echo "$usage"
+                    exit 1
+                fi
+                ;;
+        esac
+    done
+
+    # 参数检查
+    if [ -z "${READS_PATH}" ]; then
+        echo "[ERROR] Input reads path is required" >&2
+        exit 1
+    fi
+    if [ ! -f "${READS_PATH}" ]; then
+        echo "[ERROR] Input reads path \"${READS_PATH}\" is not a valid file" >&2
+        exit 1
+    fi
+    if [ -n "${OUT_DIR}" ] && [ ! -d "${OUT_DIR}" ]; then
+        echo "[WARNING] Cannot find output directory \"${OUT_DIR}\", create this directory..."
+        mkdir -p "${OUT_DIR}"
+    fi
+
+    input_dir=`dirname ${READS_PATH}`
+    input_dir=`cd ${input_dir};pwd`
+    reads_name="${READS_PATH##*/}"
+    if [ -z "${OUT_DIR}" ];then
+        OUT_DIR=$input_dir
+    fi
+
+    bind_opt="--bind ${input_dir}:/assemble_input"
+    run_opt="/assemble_input/${reads_name} -n ${N_POL} -t ${THREADS} --or ${OUT_DIR}"
+    if [ -n "${GENOME_SIZE}" ]; then
+        run_opt="${run_opt} -g ${GENOME_SIZE}"
+    fi
+    if [ "${OUT_DIR}" = "${reads_dir}" ];then
+        run_opt="${run_opt} -o /assemble_input"
+    else
+        bind_opt="${bind_opt} --bind ${OUT_DIR}:/assemble_output"
+        run_opt="${run_opt} -o /assemble_output"
+    fi
+    cmd="singularity exec ${bind_opt} ${IMAGE} qiyun_assemble ${run_opt}"
+    $cmd || echo "Draft assembly failed, please check logs for more information"
+}
+
+
+sub_polish(){
+    ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+    usage="\
+Usage: qiyun polish [-t THREADS] [-o OUT_DIR] reads/bam draft model
+
+Polish draft assembly into consensus by reads.
+
+Positional arguments:
+    reads/bam               Input path, should be fastq file or reads alignments to draft assembly, in bam format.
+    draft                   Draft assembly path, should be fasta file.
+    model                   Model name. Please run \"qiyun models\" for available models.
+
+Optional arguments:
+    -h                      Show this help and exit.
+    -t                      Number of parallel threads. (default: 1)
+    -o                      Output directory, default is draft directory.
+    "
+    READS_PATH=""
+    DRAFT_PATH=""
+    MODEL_NAME=""
+    THREADS=1
+    OUT_DIR=""
+    while [ -n "$1" ]; do
+        case "$1" in
+            -h)
+                echo "$usage"
+                exit
+                ;;
+            -t)
+                if [[ ! $2 =~ ^[0-9]+$ ]]; then
+                    echo "[ERROR] -t option should followed by an integer value" >&2
+                    exit 1
+                fi
+                THREADS="$2"
+                shift 2
+                ;;
+            -o)
+                if [[ -z "$2" ]]; then
+                    echo "[ERROR] missing argument for -o option" >&2
+                    exit 1
+                fi
+                OUT_DIR="$2"
+                shift 2
+                ;;
+            *)
+                if [[ $1 =~ ^- ]]; then
+                    echo "[ERROR] Invalid option: $1" >&2
+                    echo "$usage"
+                    exit 1
+                fi
+                
+                if [ -z $READS_PATH ]; then
+                    READS_PATH="$1"
+                    shift 1
+                elif [ -z $DRAFT_PATH ]; then
+                    DRAFT_PATH="$1"
+                    shift 1
+                elif [ -z $MODEL_NAME ]; then
+                    MODEL_NAME="$1"
+                    shift 1
+                else
+                    echo "[ERROR] Invalid option: $1" >&2
+                    echo "$usage"
+                    exit 1
+                fi
+                ;;
+        esac
+    done
+
+    # 参数检查
+    if [ -z "${READS_PATH}" ]; then
+        echo "[ERROR] Input reads path is required" >&2
+        exit 1
+    fi
+    if [ -z "${DRAFT_PATH}" ]; then
+        echo "[ERROR] Draft assembly path is required" >&2
+        exit 1
+    fi
+    if [ ! -f "${READS_PATH}" ]; then
+        echo "[ERROR] Input reads path \"${READS_PATH}\" is not a valid file" >&2
+        exit 1
+    fi
+    if [ ! -f "${DRAFT_PATH}" ]; then
+        echo "[ERROR] Draft assembly path \"${DRAFT_PATH}\" is not a valid file" >&2
+        exit 1
+    fi
+    if [ -z "${MODEL_NAME}" ]; then
+        echo "[ERROR] Name of basecall model is required." >&2
+        exit 1
+    fi
+    MODEL_PATH=''
+    MODEL_FNAME=''
+    model_files=(`ls ${ROOT}/models | grep ".qm"`)
+    for mf in "${model_files[@]}"; do
+        model_name=`singularity exec --bind ${ROOT}/models:/models ${IMAGE} /qiyun/querymodel /models/${mf}`
+        if [ "${model_name}" == "${MODEL_NAME}" ];then
+            MODEL_PATH=${ROOT}/models/${mf}
+            MODEL_FNAME=${mf}
+            break
+        fi
+    done
+    if [ -z "${MODEL_PATH}" ]; then
+        echo "[ERROR] Cannot find model ${MODEL_NAME}. Please run \"qiyun models\" for available models." >&2
+        exit 1
+    fi
+    if [ -n "${OUT_DIR}" ] && [ ! -d "${OUT_DIR}" ]; then
+        echo "[WARNING] Cannot find output directory \"${OUT_DIR}\", create this directory..."
+        mkdir -p "${OUT_DIR}"
+    fi
+
+    reads_dir=`dirname ${READS_PATH}`
+    reads_dir=`cd ${reads_dir};pwd`
+    reads_name="${READS_PATH##*/}"
+    draft_dir=`dirname ${DRAFT_PATH}`
+    draft_dir=`cd ${draft_dir};pwd`
+    draft_name="${DRAFT_PATH##*/}"
+    if [ -z "${OUT_DIR}" ];then
+        OUT_DIR=$draft_dir
+    fi
+
+    if [ "${OUT_DIR}" = "${draft_dir}" ];then
+        cmd="singularity exec \
+            --bind ${reads_dir}:/polish_input \
+            --bind ${draft_dir}:/polish_draft \
+            --bind ${ROOT}/models:/models \
+            ${IMAGE} qiyun_polish /polish_input/${reads_name} /polish_draft/${draft_name} -m /models/${MODEL_FNAME} -t ${THREADS} -o /polish_draft --or ${OUT_DIR}"
+    else
+        cmd="singularity exec \
+            --bind ${reads_dir}:/polish_input \
+            --bind ${draft_dir}:/polish_draft \
+            --bind ${ROOT}/models:/models \
+            --bind ${OUT_DIR}:/polish_output \
+            ${IMAGE} qiyun_polish /polish_input/${reads_name} /polish_draft/${draft_name} -m /models/${MODEL_FNAME} -t ${THREADS} -o /polish_output --or ${OUT_DIR}"
+    fi
+
+    $cmd || echo "Polishing failed, please check logs for more information"
+}
+
+
+sub_consensus(){
+    ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+    usage="\
+Usage: qiyun consensus [-t THREADS] [-g GENOME_SIZE] [-o OUT_DIR] reads model
+
+Generate consensus from reads.
+
+Positional arguments:
+    reads                   Input reads path, should be fastq file.
+    model                   Model name. Please run \"qiyun models\" for available models.
+
+Optional arguments:
+    -h                      Show this help and exit.
+    -g                      Estimate genome size for canu assembly, can be 4.7m, 3.5k, 4500.
+    -t                      Number of parallel threads. (default: 1)
+    -o                      Output directory, default is input reads directory.
+    "
+    READS_PATH=""
+    MODEL_NAME=""
+    GENOME_SIZE=""
+    THREADS=1
+    OUT_DIR=""
+    while [ -n "$1" ]; do
+        case "$1" in
+            -h)
+                echo "$usage"
+                exit
+                ;;
+            -t)
+                if [[ ! $2 =~ ^[0-9]+$ ]]; then
+                    echo "[ERROR] -t option should followed by an integer value" >&2
+                    exit 1
+                fi
+                THREADS="$2"
+                shift 2
+                ;;
+            -g)
+                if [[ -z "$2" ]]; then
+                    echo "[ERROR] missing argument for -g option" >&2
+                    exit 1
+                fi
+                GENOME_SIZE="$2"
+                shift 2
+                ;;
+            -o)
+                if [[ -z "$2" ]]; then
+                    echo "[ERROR] missing argument for -o option" >&2
+                    exit 1
+                fi
+                OUT_DIR="$2"
+                shift 2
+                ;;
+            *)
+                if [[ $1 =~ ^- ]]; then
+                    echo "[ERROR] Invalid option: $1" >&2
+                    echo "$usage"
+                    exit 1
+                fi
+                
+                if [ -z $READS_PATH ]; then
+                    READS_PATH="$1"
+                    shift 1
+                elif [ -z $MODEL_NAME ]; then
+                    MODEL_NAME="$1"
+                    shift 1
+                else
+                    echo "[ERROR] Invalid option: $1" >&2
+                    echo "$usage"
+                    exit 1
+                fi
+                ;;
+        esac
+    done
+
+    # 参数检查
+    if [ -z "${READS_PATH}" ]; then
+        echo "[ERROR] Input reads path is required" >&2
+        exit 1
+    fi
+    if [ ! -f "${READS_PATH}" ]; then
+        echo "[ERROR] Input reads path \"${READS_PATH}\" is not a valid file" >&2
+        exit 1
+    fi
+    if [ -z "${MODEL_NAME}" ]; then
+        echo "[ERROR] Name of basecall model is required." >&2
+        exit 1
+    fi
+    MODEL_PATH=''
+    MODEL_FNAME=''
+    model_files=(`ls ${ROOT}/models | grep ".qm"`)
+    for mf in "${model_files[@]}"; do
+        model_name=`singularity exec --bind ${ROOT}/models:/models ${IMAGE} /qiyun/querymodel /models/${mf}`
+        if [ "${model_name}" == "${MODEL_NAME}" ];then
+            MODEL_PATH=${ROOT}/models/${mf}
+            MODEL_FNAME=${mf}
+            break
+        fi
+    done
+    if [ -z "${MODEL_PATH}" ]; then
+        echo "[ERROR] Cannot find model ${MODEL_NAME}. Please run \"qiyun models\" for available models." >&2
+        exit 1
+    fi
+    if [ -n "${OUT_DIR}" ] && [ ! -d "${OUT_DIR}" ]; then
+        echo "[WARNING] Cannot find output directory \"${OUT_DIR}\", create this directory..."
+        mkdir -p "${OUT_DIR}"
+    fi
+
+    reads_dir=`dirname ${READS_PATH}`
+    reads_dir=`cd ${reads_dir};pwd`
+    reads_name="${READS_PATH##*/}"
+    if [ -z "${OUT_DIR}" ];then
+        OUT_DIR=$reads_dir
+    fi
+
+    bind_opt="--bind ${TMP_PATH}:/qiyun/temp --bind ${reads_dir}:/consensus_input --bind ${ROOT}/models:/models"
+    run_opt="/consensus_input/${reads_name} -m /models/${MODEL_FNAME} -t ${THREADS} --or ${OUT_DIR}"
+    if [ -n "${GENOME_SIZE}" ]; then
+        run_opt="${run_opt} -g ${GENOME_SIZE}"
+    fi
+    if [ "${OUT_DIR}" = "${reads_dir}" ];then
+        run_opt="${run_opt} -o /consensus_input"
+    else
+        bind_opt="${bind_opt} --bind ${OUT_DIR}:/consensus_output"
+        run_opt="${run_opt} -o /consensus_output"
+    fi
+    cmd="singularity exec ${bind_opt} ${IMAGE} qiyun_consensus ${run_opt}"
+    $cmd || echo "Error occur when generating consensus, please check logs for more information"
+
+    temp_file=${TMP_PATH}/NanoFilt.log
+    if [ -f "${temp_file}" ];then
+        rm ${temp_file}
+    fi
+
+}
+
+
+sub_evaluate(){
+    usage="\
+Usage: qiyun evaluate [-c CHUNK_SIZE] [-t THREADS] [-o OUT_DIR] [-r REF] consensus
+
+Evaluate consensus sequence. Consensus will be broken into chunks before aligning to reference. Stats accuracies among these chunks can avoid low-complexity and repeat regions, which are hard to benchmark.
+
+Positional arguments:
+    consensus               Consensus sequence file, in fasta format.
+
+Optional arguments:
+    -h                      Show this help and exit.
+    -r                      Reference sequence file, in fasta format.
+    -c                      Chunk size for consensus sequence. (default: 100000)
+    -t                      Number of parallel threads. (default: 1)
+    -o                      Output directory, default is input consensus directory.
+    "
+
+    CONSENSUS_PATH=""
+    REF_PATH=""
+    CHUNK_SIZE=100000
+    THREADS=1
+    OUT_DIR=""
+    while [ -n "$1" ]; do
+        case "$1" in
+            -h)
+                echo "$usage"
+                exit
+                ;;
+            -c)
+                if [[ ! $2 =~ ^[0-9]+$ ]]; then
+                    echo "[ERROR] -c option should followed by an integer value" >&2
+                    exit 1
+                fi
+                CHUNK_SIZE="$2"
+                shift 2
+                ;;
+            -t)
+                if [[ ! $2 =~ ^[0-9]+$ ]]; then
+                    echo "[ERROR] -t option should followed by an integer value" >&2
+                    exit 1
+                fi
+                THREADS="$2"
+                shift 2
+                ;;
+            -o)
+                if [[ -z "$2" ]]; then
+                    echo "[ERROR] missing argument for -o option" >&2
+                    exit 1
+                fi
+                OUT_DIR="$2"
+                shift 2
+                ;;
+            -r)
+                if [[ -z "$2" ]]; then
+                    echo "[ERROR] missing argument for -r option" >&2
+                    exit 1
+                fi
+                REF_PATH="$2"
+                shift 2
+                ;;
+            *)
+                if [[ $1 =~ ^- ]]; then
+                    echo "[ERROR] Invalid option: $1" >&2
+                    echo "$usage"
+                    exit 1
+                fi
+                
+                if [ -z $CONSENSUS_PATH ]; then
+                    CONSENSUS_PATH="$1"
+                    shift 1
+                else
+                    echo "[ERROR] Invalid option: $1" >&2
+                    echo "$usage"
+                    exit 1
+                fi
+                ;;
+        esac
+    done
+
+    # 参数检查
+    if [ -z "${CONSENSUS_PATH}" ]; then
+        echo "[ERROR] Input consensus path is required" >&2
+        exit 1
+    fi
+    if [ ! -f "${CONSENSUS_PATH}" ]; then
+        echo "[ERROR] Input consensus path \"${CONSENSUS_PATH}\" is not a valid file" >&2
+        exit 1
+    fi
+    if [ -n "${REF_PATH}" ]; then
+        if [ ! -f "${REF_PATH}" ]; then
+          echo "[ERROR] Input reference path \"${REF_PATH}\" is not a valid file" >&2
+          exit 1
+        fi
+    fi
+
+    if [ -n "${OUT_DIR}" ] && [ ! -d "${OUT_DIR}" ]; then
+        echo "[WARNING] Cannot find output directory \"${OUT_DIR}\", create this directory..."
+        mkdir -p "${OUT_DIR}"
+    fi
+    consensus_dir=`dirname ${CONSENSUS_PATH}`
+    consensus_dir=`cd ${consensus_dir};pwd`
+    consensus_name="${CONSENSUS_PATH##*/}"
+    if [ -z "${OUT_DIR}" ];then
+          OUT_DIR=$consensus_dir
+    fi
+
+    if [ -n "${REF_PATH}" ]; then
+      ref_dir=`dirname ${REF_PATH}`
+      ref_dir=`cd ${ref_dir};pwd`
+      ref_name="${REF_PATH##*/}"
+
+      if [ "${OUT_DIR}" = "${consensus_dir}" ];then
+          cmd="singularity exec \
+              --bind ${consensus_dir}:/evaluate_consensus \
+              --bind ${ref_dir}:/evaluate_ref \
+              --bind ${TMP_PATH}:/qiyun/temp \
+              ${IMAGE} qiyun_evaluate /evaluate_consensus/${consensus_name} -r /evaluate_ref/${ref_name} -c ${CHUNK_SIZE} -t ${THREADS} -o /evaluate_consensus --or ${OUT_DIR}"
+      else
+          cmd="singularity exec \
+              --bind ${consensus_dir}:/evaluate_consensus \
+              --bind ${ref_dir}:/evaluate_ref \
+              --bind ${OUT_DIR}:/evaluate_output \
+              --bind ${TMP_PATH}:/qiyun/temp \
+              ${IMAGE} qiyun_evaluate /evaluate_consensus/${consensus_name} -r /evaluate_ref/${ref_name} -c ${CHUNK_SIZE} -t ${THREADS} -o /evaluate_output --or ${OUT_DIR}"
+      fi
+    else
+      if [ "${OUT_DIR}" = "${consensus_dir}" ];then
+          cmd="singularity exec \
+              --bind ${consensus_dir}:/evaluate_consensus \
+              --bind ${TMP_PATH}:/qiyun/temp \
+              ${IMAGE} qiyun_evaluate /evaluate_consensus/${consensus_name} -t ${THREADS} -o /evaluate_consensus --or ${OUT_DIR}"
+      else
+          cmd="singularity exec \
+              --bind ${consensus_dir}:/evaluate_consensus \
+              --bind ${OUT_DIR}:/evaluate_output \
+              --bind ${TMP_PATH}:/qiyun/temp \
+              ${IMAGE} qiyun_evaluate /evaluate_consensus/${consensus_name} -t ${THREADS} -o /evaluate_output --or ${OUT_DIR}"
+      fi
+    fi
+    $cmd || echo "Error occur when evaluating consensus, please check logs for more information"
+
+    temp_file=${TMP_PATH}/chunked_consensus.fasta
+    if [ -f "${temp_file}" ];then
+        rm ${temp_file}
+    fi
+}
+
+
+sub_hap_variant(){
+    ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+    usage="\
+Usage: qiyun hap_variant [-t THREADS] [-r REGIONS] [-d DEPTH] [-o OUT_DIR] reads ref model
+
+Detecting haploid variants from reads.
+
+Positional arguments:
+    reads                   Input reads path, should be fastq file.
+    ref                     Reference sequence file, in fasta format.
+    model                   Model name. Please run \"qiyun models\" for available models.
+
+Optional arguments:
+    -h                      Show this help and exit.
+    -t                      Number of parallel threads. (default: 1)
+    -r                      Specify variants detection regions in reference, should be bed file. All positions in reference that reads cover will be processed by default.
+    -d                      Depth threshold for high-confidence checking. (default: 15)
+    -o                      Output directory, default is input reads directory.
+    "
+    READS_PATH=""
+    REF_PATH=""
+    MODEL_NAME=""
+    THREADS=1
+    DEPTH=15
+    OUT_DIR=""
+    REGION_PATH=""
+    while [ -n "$1" ]; do
+        case "$1" in
+            -h)
+                echo "$usage"
+                exit
+                ;;
+            -t)
+                if [[ ! $2 =~ ^[0-9]+$ ]]; then
+                    echo "[ERROR] -t option should followed by an integer value" >&2
+                    exit 1
+                fi
+                THREADS="$2"
+                shift 2
+                ;;
+            -d)
+                if [[ ! $2 =~ ^[0-9]+$ ]]; then
+                    echo "[ERROR] -d option should followed by an integer value" >&2
+                    exit 1
+                fi
+                DEPTH="$2"
+                shift 2
+                ;;
+            -r)
+                if [[ -z "$2" ]]; then
+                    echo "[ERROR] missing argument for -r optione" >&2
+                    exit 1
+                fi
+                REGION_PATH="$2"
+                shift 2
+                ;;
+            -o)
+                if [[ -z "$2" ]]; then
+                    echo "[ERROR] missing argument for -o option" >&2
+                    exit 1
+                fi
+                OUT_DIR="$2"
+                shift 2
+                ;;
+            *)
+                if [[ $1 =~ ^- ]]; then
+                    echo "[ERROR] Invalid option: $1" >&2
+                    echo "$usage"
+                    exit 1
+                fi
+                
+                if [ -z $READS_PATH ]; then
+                    READS_PATH="$1"
+                    shift 1
+                elif [ -z $REF_PATH ]; then
+                    REF_PATH="$1"
+                    shift 1
+                elif [ -z $MODEL_NAME ]; then
+                    MODEL_NAME="$1"
+                    shift 1
+                else
+                    echo "[ERROR] Invalid option: $1" >&2
+                    echo "$usage"
+                    exit 1
+                fi
+                ;;
+        esac
+    done
+
+    # 参数检查
+    if [ -z "${READS_PATH}" ]; then
+        echo "[ERROR] Input reads path is required" >&2
+        exit 1
+    fi
+    if [ ! -f "${READS_PATH}" ]; then
+        echo "[ERROR] Input reads path \"${READS_PATH}\" is not a valid file" >&2
+        exit 1
+    fi
+    if [ -z "${REF_PATH}" ]; then
+        echo "[ERROR] Reference path is required" >&2
+        exit 1
+    fi
+    if [ ! -f "${REF_PATH}" ]; then
+        echo "[ERROR] Reference path \"${REF_PATH}\" is not a valid file" >&2
+        exit 1
+    fi
+    if [ -z "${MODEL_NAME}" ]; then
+        echo "[ERROR] Name of basecall model is required." >&2
+        exit 1
+    fi
+    MODEL_PATH=''
+    MODEL_FNAME=''
+    model_files=(`ls ${ROOT}/models | grep ".qm"`)
+    for mf in "${model_files[@]}"; do
+        model_name=`singularity exec --bind ${ROOT}/models:/models ${IMAGE} /qiyun/querymodel /models/${mf}`
+        if [ "${model_name}" == "${MODEL_NAME}" ];then
+            MODEL_PATH=${ROOT}/models/${mf}
+            MODEL_FNAME=${mf}
+            break
+        fi
+    done
+    if [ -z "${MODEL_PATH}" ]; then
+        echo "[ERROR] Cannot find model ${MODEL_NAME}. Please run \"qiyun models\" for available models." >&2
+        exit 1
+    fi
+    if [ -n "${OUT_DIR}" ] && [ ! -d "${OUT_DIR}" ]; then
+        echo "[WARNING] Cannot find output directory \"${OUT_DIR}\", create this directory..."
+        mkdir -p "${OUT_DIR}"
+    fi
+    if [ -n "${REGION_PATH}" ] && [ ! -f "${REGION_PATH}" ]; then
+        echo "[ERROR] Region path \"${REGION_PATH}\" is not a valid file" >&2
+        exit 1
+    fi
+
+    ref_dir=`dirname ${REF_PATH}`
+    ref_dir=`cd ${ref_dir};pwd`
+    ref_name="${REF_PATH##*/}"
+    reads_dir=`dirname ${READS_PATH}`
+    reads_dir=`cd ${reads_dir};pwd`
+    reads_name="${READS_PATH##*/}"
+    if [ -z "${OUT_DIR}" ];then
+        OUT_DIR=$reads_dir
+    fi
+
+    bind_opt="--bind ${reads_dir}:/variant_input --bind ${ref_dir}:/variant_ref --bind ${ROOT}/models:/models"
+    run_opt="/variant_input/${reads_name} --ref /variant_ref/${ref_name} -m /models/${MODEL_FNAME} -t ${THREADS} -d ${DEPTH} --or ${OUT_DIR}"
+    if [ -n "${REGION_PATH}" ]; then
+        region_dir=`dirname ${REGION_PATH}`
+        region_dir=`cd ${region_dir};pwd`
+        region_name="${REGION_PATH##*/}"
+        bind_opt="${bind_opt} --bind ${region_dir}:/variant_regions"
+        run_opt="${run_opt} --reg /variant_regions/${region_name}"
+    fi
+    if [ "${OUT_DIR}" = "${reads_dir}" ];then
+        run_opt="${run_opt} -o /variant_input"
+    else
+        bind_opt="${bind_opt} --bind ${OUT_DIR}:/variant_output"
+        run_opt="${run_opt} -o /variant_output"
+    fi
+    cmd="singularity exec ${bind_opt} ${IMAGE} qiyun_hap_variant ${run_opt}"
+    $cmd || echo "Error occur when calling haploid variants, please check logs for more information"
+}
+
+
+sub_consensus2vcf(){
+    usage="\
+Usage: qiyun consensus2vcf [-t THREADS] [-r REGIONS] [-o OUT_DIR] consensus ref
+
+Aligning consensus to reference and detecting haploid variants.
+
+Positional arguments:
+    consensus               Consensus file path, should be fasta file.
+    ref                     Reference sequence file, in fasta format.
+
+Optional arguments:
+    -h                      Show this help and exit.
+    -t                      Number of parallel threads. (default: 1)
+    -r                      Specify variants detection regions in reference, should be bed file. All positions in reference that reads cover will be processed by default.
+    -o                      Output directory, default is input consensus directory.
+    "
+    CONSENSUS_PATH=""
+    REF_PATH=""
+    REGION_PATH=""
+    THREADS=1
+    OUT_DIR=""
+    while [ -n "$1" ]; do
+        case "$1" in
+            -h)
+                echo "$usage"
+                exit
+                ;;
+            -t)
+                if [[ ! $2 =~ ^[0-9]+$ ]]; then
+                    echo "[ERROR] -t option should followed by an integer value" >&2
+                    exit 1
+                fi
+                THREADS="$2"
+                shift 2
+                ;;
+            -o)
+                if [[ -z "$2" ]]; then
+                    echo "[ERROR] missing argument for -o option" >&2
+                    exit 1
+                fi
+                OUT_DIR="$2"
+                shift 2
+                ;;
+            -r)
+                if [[ -z "$2" ]]; then
+                    echo "[ERROR] missing argument for -r option" >&2
+                    exit 1
+                fi
+                REGION_PATH="$2"
+                shift 2
+                ;;
+            *)
+                if [[ $1 =~ ^- ]]; then
+                    echo "[ERROR] Invalid option: $1" >&2
+                    echo "$usage"
+                    exit 1
+                fi
+                
+                if [ -z $CONSENSUS_PATH ]; then
+                    CONSENSUS_PATH="$1"
+                    shift 1
+                elif [ -z $REF_PATH ]; then
+                    REF_PATH="$1"
+                    shift 1
+                else
+                    echo "[ERROR] Invalid option: $1" >&2
+                    echo "$usage"
+                    exit 1
+                fi
+                ;;
+        esac
+    done
+
+    # 参数检查
+    if [ -z "${CONSENSUS_PATH}" ]; then
+        echo "[ERROR] Input consensus path is required" >&2
+        exit 1
+    fi
+    if [ -z "${REF_PATH}" ]; then
+        echo "[ERROR] Reference path is required" >&2
+        exit 1
+    fi
+    if [ ! -f "${CONSENSUS_PATH}" ]; then
+        echo "[ERROR] Input consensus path \"${CONSENSUS_PATH}\" is not a valid file" >&2
+        exit 1
+    fi
+    if [ ! -f "${REF_PATH}" ]; then
+        echo "[ERROR] Reference path \"${REF_PATH}\" is not a valid file" >&2
+        exit 1
+    fi
+    if [ -n "${REGION_PATH}" ] && [ ! -f "${REGION_PATH}" ]; then
+        echo "[ERROR] Region file \"${REGION_PATH}\" is not a valid file." >&2
+        exit 1
+    fi
+    if [ -n "${OUT_DIR}" ] && [ ! -d "${OUT_DIR}" ]; then
+        echo "[WARNING] Cannot find output directory \"${OUT_DIR}\", create this directory..."
+        mkdir -p "${OUT_DIR}"
+    fi
+
+    consensus_dir=`dirname ${CONSENSUS_PATH}`
+    consensus_dir=`cd ${consensus_dir};pwd`
+    consensus_name="${CONSENSUS_PATH##*/}"
+    ref_dir=`dirname ${REF_PATH}`
+    ref_dir=`cd ${ref_dir};pwd`
+    ref_name="${REF_PATH##*/}"
+    if [ -z "${OUT_DIR}" ];then
+        OUT_DIR=$consensus_dir
+    fi
+
+    bind_opt="--bind ${consensus_dir}:/consensus_path --bind ${ref_dir}:/ref_path"
+    run_opt="/consensus_path/${consensus_name} /ref_path/${ref_name} -t ${THREADS} --or ${OUT_DIR}"
+    if [ -n "${REGION_PATH}" ]; then
+        region_dir=`dirname ${REGION_PATH}`
+        region_dir=`cd ${region_dir};pwd`
+        region_name="${REGION_PATH##*/}"
+        bind_opt="${bind_opt} --bind ${region_dir}:/variant_regions"
+        run_opt="${run_opt} -r /variant_regions/${region_name}"
+    fi
+    if [ "${OUT_DIR}" = "${reads_dir}" ];then
+        run_opt="${run_opt} -o /variant_input"
+    else
+        bind_opt="${bind_opt} --bind ${OUT_DIR}:/variant_output"
+        run_opt="${run_opt} -o /variant_output"
+    fi
+    cmd="singularity exec ${bind_opt} ${IMAGE} qiyun_consensus2vcf ${run_opt}"
+    $cmd || echo "Error occur when calling consensus2vcf, please check logs for more information"
+}
+
+
+sub_evaluate_vcf(){
+    usage="\
+Usage: qiyun evaluate_vcf [-t THREADS] [-r REGIONS] [-o OUT_DIR] truth_vcf query_vcf ref
+
+Compare query vcf to truth vcf and output summary in csv format.
+
+Positional arguments:
+    truth_vcf               Truth vcf file.
+    query_vcf               Query vcf file.
+    ref                     Reference sequence file, in fasta format.
+
+Optional arguments:
+    -h                      Show this help and exit.
+    -t                      Number of parallel threads. (default: 1)
+    -r                      Specify ref regions for variants comparison, should be bed file. All records will be compared by default.
+    -o                      Output directory, default directory where query vcf file locates.
+    "
+    QUERY_PATH=""
+    TRUTH_PATH=""
+    REF_PATH=""
+    THREADS=1
+    REGION_PATH=""
+    OUT_DIR=""
+    while [ -n "$1" ]; do
+        case "$1" in
+            -h)
+                echo "$usage"
+                exit
+                ;;
+            -t)
+                if [[ ! $2 =~ ^[0-9]+$ ]]; then
+                    echo "[ERROR] -t option should followed by an integer value" >&2
+                    exit 1
+                fi
+                THREADS="$2"
+                shift 2
+                ;;
+            -o)
+                if [[ -z "$2" ]]; then
+                    echo "[ERROR] missing argument for -o option" >&2
+                    exit 1
+                fi
+                OUT_DIR="$2"
+                shift 2
+                ;;
+            -r)
+                if [[ -z "$2" ]]; then
+                    echo "[ERROR] missing argument for -r option" >&2
+                    exit 1
+                fi
+                REGION_PATH="$2"
+                shift 2
+                ;;
+            *)
+                if [[ $1 =~ ^- ]]; then
+                    echo "[ERROR] Invalid option: $1" >&2
+                    echo "$usage"
+                    exit 1
+                fi
+                
+                if [ -z $TRUTH_PATH ]; then
+                    TRUTH_PATH="$1"
+                    shift 1
+                elif [ -z $QUERY_PATH ]; then
+                    QUERY_PATH="$1"
+                    shift 1
+                elif [ -z $REF_PATH ]; then
+                    REF_PATH="$1"
+                    shift 1
+                else
+                    echo "[ERROR] Invalid option: $1" >&2
+                    echo "$usage"
+                    exit 1
+                fi
+                ;;
+        esac
+    done
+
+    # 参数检查
+    if [ -z "${QUERY_PATH}" ]; then
+        echo "[ERROR] Input query vcf is required" >&2
+        exit 1
+    fi
+    if [ ! -f "${QUERY_PATH}" ]; then
+        echo "[ERROR] Input query vcf \"${QUERY_PATH}\" is not a valid file" >&2
+        exit 1
+    fi
+    if [ -z "${TRUTH_PATH}" ]; then
+        echo "[ERROR] Input truth vcf is required" >&2
+        exit 1
+    fi
+    if [ ! -f "${TRUTH_PATH}" ]; then
+        echo "[ERROR] Input truth vcf \"${TRUTH_PATH}\" is not a valid file" >&2
+        exit 1
+    fi
+    if [ -z "${REF_PATH}" ]; then
+        echo "[ERROR] Reference file is required" >&2
+        exit 1
+    fi
+    if [ ! -f "${REF_PATH}" ]; then
+        echo "[ERROR] Reference file path \"${REF_PATH}\" is not a valid file" >&2
+        exit 1
+    fi
+    if [ -n "${REGION_PATH}" ] && [ ! -f "${REGION_PATH}" ]; then
+        echo "[ERROR] Region file \"${REGION_PATH}\" is not a valid file." >&2
+        exit 1
+    fi
+    if [ -n "${OUT_DIR}" ] && [ ! -d "${OUT_DIR}" ]; then
+        echo "[WARNING] Cannot find output directory \"${OUT_DIR}\", create this directory..."
+        mkdir -p "${OUT_DIR}"
+    fi
+
+    query_dir=`dirname ${QUERY_PATH}`
+    query_dir=`cd ${query_dir};pwd`
+    query_name="${QUERY_PATH##*/}"
+    truth_dir=`dirname ${TRUTH_PATH}`
+    truth_dir=`cd ${truth_dir};pwd`
+    truth_name="${TRUTH_PATH##*/}"
+    ref_dir=`dirname ${REF_PATH}`
+    ref_dir=`cd ${ref_dir};pwd`
+    ref_name="${REF_PATH##*/}"
+    if [ -z "${OUT_DIR}" ];then
+        OUT_DIR=$query_dir
+    fi
+
+    bind_opt="--bind ${query_dir}:/query_variant --bind ${truth_dir}:/truth_variant --bind ${ref_dir}:/variant_ref"
+    run_opt="/truth_variant/${truth_name} /query_variant/${query_name} /variant_ref/${ref_name} --or ${OUT_DIR} -t ${THREADS}"
+    if [ -n "${REGION_PATH}" ]; then
+        region_dir=`dirname ${REGION_PATH}`
+        region_dir=`cd ${region_dir};pwd`
+        region_name="${REGION_PATH##*/}"
+        bind_opt="${bind_opt} --bind ${region_dir}:/variant_regions"
+        run_opt="${run_opt} -r /variant_regions/${region_name}"
+    fi
+    if [ "${OUT_DIR}" == "${query_dir}" ];then
+        run_opt="${run_opt} -o /query_variant"
+    else
+        bind_opt="${bind_opt} --bind ${OUT_DIR}:/variant_output"
+        run_opt="${run_opt} -o /variant_output"
+    fi
+    cmd="singularity exec ${bind_opt} ${IMAGE} qiyun_evaluate_vcf ${run_opt}"
+    $cmd || echo "Error occur when evaluate vcf, please check logs for more information"
+}
+
+
+sub_models(){
+    ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+    echo "Qiyun shares the same model names with basecall models. Please check \"basecall-config.txt\" in ResultFiles for model name. The available models are listed below:"
+    model_files=(`ls ${ROOT}/models | grep ".qm"`)
+    declare -A model_dic
+    model_dic["QDSv1.1_QCell384Pv1.1_QDLEv1.1_DBv4.1.3"]="K1M2-PCB-Lipid-Fast"
+    model_dic["QDSv1.1_QCell384Pv1.1_QDLEv1.1_NTGv4.2.2"]="K1M2-PCB-Lipid-Hac"
+    model_dic["QDSv2.0_QCell384Pv2.0_QDLEv1.0_DBv4.1.3"]="K2M1-PCB-Lipid-Fast"
+    model_dic["QDSv2.0_QCell384Pv2.0_QDLEv1.0_NTGv4.1.3"]="K2M1-PCB-Lipid-Hac"
+    model_dic["QDSv1.1_QCell384v1.1_QDLEv1.1_DBv5.1.0"]="K1M2-Si-Polymer-Fast"
+    model_dic["QDSv1.1_QCell384v1.1_QDLEv1.1_NTGv5.1.0"]="K1M2-Si-Polymer-Hac"
+    model_dic["QDSv1.1_QCell384v1.0_QDLEv1.1_DBv4.1.1"]="K1M2-Si-Lipid-Fast"
+    model_dic["QDSv1.1_QCell384v1.0_QDLEv1.1_NTGv4.2.0"]="K1M2-Si-Lipid-Hac"
+    for mf in "${model_files[@]}"; do
+        model_name=`singularity exec --bind ${ROOT}/models:/models ${IMAGE} /qiyun/querymodel /models/${mf}`
+        echo "  - ${model_name} (${model_dic[${model_name}]})"
+    done
+}
+
+subcommand=$1
+case $subcommand in
+    "" | "-h")
+        sub_help
+        ;;
+    "-v")
+        echo "${ProgName}_release - $VER"
+        ;;
+    *)
+        shift
+        sub_${subcommand} $@
+        if [ $? = 127 ]; then
+            echo "Error: '$subcommand' is not a valid commands." >&2
+            echo "See '$ProgName -h' for more information" >&2
+            exit 1
+        fi
+        ;;
+esac
+
+
