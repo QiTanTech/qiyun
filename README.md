@@ -28,6 +28,9 @@ Some files in the repository are large file (LFS), so you need to install [git-l
 Or you can download the repository as a [zip file](https://github.com/QiTanTech/qiyun/archive/refs/heads/v1.3.zip) and extract it.
 
 Check the md5sum of large file to make sure the file is correct.
+
 qiyun_release_v1.3.sif: d676f55b62800b2be779aebf08a86e8a
+
 singularity_setup/go1.20.5.linux-amd64.tar.gz: 4504f55404e8021531fcbcfc669ebf87
+
 singularity_setup/singularity-ce-3.11.4.tar.gz: c534f0cdb7e0c2dc4affcdf0845db757
